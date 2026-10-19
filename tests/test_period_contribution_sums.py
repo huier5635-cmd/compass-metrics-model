@@ -12,6 +12,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from compass_metrics_v2 import contributor_metrics_v2 as metrics
+from compass_metrics_v2 import developer_metrics_v2 as developer_metrics
 
 
 URL = os.environ.get("COMPASS_TEST_SEARCH_URL")
@@ -76,8 +77,8 @@ class PeriodContributionSumsTest(unittest.TestCase):
             ]),
         ])
 
-    def metric(self, key):
-        return getattr(metrics, key + "_by_period")(
+    def metric(self, key, module=metrics):
+        return getattr(module, key + "_by_period")(
             self.client, self.index, DATE, [REPO], "month"
         )
 
@@ -133,6 +134,32 @@ class PeriodContributionSumsTest(unittest.TestCase):
             "total_non_code_contribution": 48, "period": "month",
         })
 
+    def test_developer_org_non_code_includes_mixed_contributors(self):
+        self.mixed()
+        self.assertEqual(self.metric("org_non_code_contribution", developer_metrics), {
+            "org_non_code_contribution": 20, "period": "month",
+        })
+
+    def test_developer_individual_non_code_includes_mixed_contributors(self):
+        self.mixed()
+        self.assertEqual(self.metric("individual_non_code_contribution", developer_metrics), {
+            "individual_non_code_contribution": 28, "period": "month",
+        })
+
+    def test_developer_org_non_code_ratio_uses_all_non_code_entries(self):
+        self.mixed()
+        self.assertEqual(self.metric("org_non_code_contribution_ratio", developer_metrics), {
+            "org_non_code_contribution_ratio": 20 / 48, "org_non_code_contribution": 20,
+            "total_non_code_contribution": 48, "period": "month",
+        })
+
+    def test_developer_individual_non_code_ratio_uses_all_non_code_entries(self):
+        self.mixed()
+        self.assertEqual(self.metric("individual_non_code_contribution_ratio", developer_metrics), {
+            "individual_non_code_contribution_ratio": 28 / 48, "individual_non_code_contribution": 28,
+            "total_non_code_contribution": 48, "period": "month",
+        })
+
     def assert_totals(self, org_code, person_code, org_non_code, person_non_code):
         for kind, org, person in [
             ("code", org_code, person_code), ("non_code", org_non_code, person_non_code),
@@ -140,11 +167,13 @@ class PeriodContributionSumsTest(unittest.TestCase):
             total = org + person
             for owner, amount in [("org", org), ("individual", person)]:
                 key = owner + "_" + kind + "_contribution"
-                self.assertEqual(self.metric(key)[key], amount)
-                result = self.metric(key + "_ratio")
-                self.assertEqual(result[key], amount)
-                self.assertEqual(result["total_" + kind + "_contribution"], total)
-                self.assertEqual(result[key + "_ratio"], amount / total if total else None)
+                modules = [metrics, developer_metrics] if kind == "non_code" else [metrics]
+                for module in modules:
+                    self.assertEqual(self.metric(key, module)[key], amount)
+                    result = self.metric(key + "_ratio", module)
+                    self.assertEqual(result[key], amount)
+                    self.assertEqual(result["total_" + kind + "_contribution"], total)
+                    self.assertEqual(result[key + "_ratio"], amount / total if total else None)
 
     def test_empty_index_keeps_zero_counts_and_none_ratios(self):
         self.assert_totals(0, 0, 0, 0)

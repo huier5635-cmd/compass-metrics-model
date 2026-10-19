@@ -56,35 +56,39 @@ jobs:
           else:
               raise RuntimeError('test search service did not start')
           PY
-      - name: Prove eight regressions fail on exact upstream source
+      - name: Prove twelve regressions fail on exact upstream source
         run: |
           python - <<'PY'
           from pathlib import Path
           import subprocess
           import sys
-          target = Path('compass_metrics_v2/contributor_metrics_v2.py')
-          fixed = target.read_bytes()
-          original = subprocess.check_output([
+          targets = [Path('compass_metrics_v2') / name for name in [
+              'contributor_metrics_v2.py', 'developer_metrics_v2.py',
+          ]]
+          fixed = {target: target.read_bytes() for target in targets}
+          original = {target: subprocess.check_output([
               'git', 'show',
               '3b5b042ed1db2ec95e58e032ccc5e9d92d690ce7:' + target.as_posix(),
-          ])
+          ]) for target in targets}
           runner = '''import unittest
           suite = unittest.defaultTestLoader.discover('tests', pattern='test_period_contribution_sums.py')
           result = unittest.TextTestRunner(verbosity=2).run(suite)
-          assert result.testsRun == 13, result.testsRun
-          assert len(result.failures) == 8, len(result.failures)
+          assert result.testsRun == 17, result.testsRun
+          assert len(result.failures) == 12, len(result.failures)
           assert not result.errors, result.errors
           assert not result.skipped, result.skipped
-          print('Baseline verified: 8 failed, 5 passed, 0 errors, 0 skips')
+          print('Baseline verified: 12 failed, 5 passed, 0 errors, 0 skips')
           '''
           try:
-              target.write_bytes(original)
+              for target in targets:
+                  target.write_bytes(original[target])
               subprocess.run([sys.executable, '-c', runner], check=True)
           finally:
-              target.write_bytes(fixed)
-          assert target.read_bytes() == fixed
+              for target in targets:
+                  target.write_bytes(fixed[target])
+          assert all(target.read_bytes() == fixed[target] for target in targets)
           PY
-      - name: Run all thirteen regressions on the fixed source
+      - name: Run all seventeen regressions on the fixed source
         run: python -m unittest discover -s tests -p test_period_contribution_sums.py -v
       - name: Service diagnostics and cleanup
         if: always()
