@@ -1,0 +1,91 @@
+name: Verify period contribution sums
+
+on:
+  push:
+    branches: [verify/period-contribution-sums-v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-search:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [elasticsearch, opensearch]
+    env:
+      COMPASS_TEST_SEARCH_URL: http://localhost:9200
+      COMPASS_TEST_SEARCH_CLIENT: ${{ matrix.engine }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Install the repository's declared dependencies
+        run: python -m pip install -r requirements.txt requests==2.31.0
+      - name: Start disposable search service on loopback
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          if [ "$COMPASS_TEST_SEARCH_CLIENT" = elasticsearch ]; then
+            docker run -d --name compass-sums-test -p 127.0.0.1:9200:9200 \
+              -e discovery.type=single-node -e xpack.security.enabled=false \
+              -e ES_JAVA_OPTS='-Xms512m -Xmx512m' \
+              docker.elastic.co/elasticsearch/elasticsearch:6.8.23
+          else
+            docker run -d --name compass-sums-test -p 127.0.0.1:9200:9200 \
+              -e discovery.type=single-node -e DISABLE_INSTALL_DEMO_CONFIG=true \
+              -e DISABLE_SECURITY_PLUGIN=true -e OPENSEARCH_JAVA_OPTS='-Xms512m -Xmx512m' \
+              opensearchproject/opensearch:2.19.0
+          fi
+          python - <<'PY'
+          import time
+          import urllib.request
+          for attempt in range(90):
+              try:
+                  with urllib.request.urlopen('http://localhost:9200', timeout=2) as response:
+                      print(response.read().decode())
+                  break
+              except OSError:
+                  time.sleep(2)
+          else:
+              raise RuntimeError('test search service did not start')
+          PY
+      - name: Prove eight regressions fail on exact upstream source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+          target = Path('compass_metrics_v2/contributor_metrics_v2.py')
+          fixed = target.read_bytes()
+          original = subprocess.check_output([
+              'git', 'show',
+              '3b5b042ed1db2ec95e58e032ccc5e9d92d690ce7:' + target.as_posix(),
+          ])
+          runner = '''import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_period_contribution_sums.py')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == 13, result.testsRun
+          assert len(result.failures) == 8, len(result.failures)
+          assert not result.errors, result.errors
+          assert not result.skipped, result.skipped
+          print('Baseline verified: 8 failed, 5 passed, 0 errors, 0 skips')
+          '''
+          try:
+              target.write_bytes(original)
+              subprocess.run([sys.executable, '-c', runner], check=True)
+          finally:
+              target.write_bytes(fixed)
+          assert target.read_bytes() == fixed
+          PY
+      - name: Run all thirteen regressions on the fixed source
+        run: python -m unittest discover -s tests -p test_period_contribution_sums.py -v
+      - name: Service diagnostics and cleanup
+        if: always()
+        run: |
+          docker logs compass-sums-test || true
+          docker rm -f compass-sums-test || true
