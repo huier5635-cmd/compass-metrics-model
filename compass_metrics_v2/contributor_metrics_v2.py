@@ -1423,12 +1423,25 @@ def _get_contributor_cardinality(client, index, query, field="contributor.keywor
     return result["aggregations"]["count"]["value"]
 
 
-def _get_contribution_sum(client, index, query):
-    """获取贡献量总和"""
+def _get_contribution_sum(client, index, query, contribution_types, exclude=False):
+    """Sum matching activity entries, rather than the contributor's all-type total."""
     query_copy = query.copy()
     query_copy["aggs"] = {
         "total_contribution": {
-            "sum": {"field": "contribution"}
+            "sum": {
+                "script": {
+                    "source": """
+                        double total = 0;
+                        for (def item : params._source.contribution_type_list) {
+                            if (params.types.contains(item.contribution_type) != params.exclude) {
+                                total += item.contribution;
+                            }
+                        }
+                        return total;
+                    """,
+                    "params": {"types": contribution_types, "exclude": exclude}
+                }
+            }
         }
     }
     result = client.search(index=index, body=query_copy)
@@ -1585,10 +1598,7 @@ def org_non_code_contribution_by_period(client, contributors_enriched_index, end
     query = _base_contributor_query(repo_list, from_date, to_date, [
         {"match_phrase": {"ecological_type": "organization"}}
     ])
-    query["query"]["bool"]["must_not"] = [
-        {"terms": {"contribution_type_list.contribution_type.keyword": code_types}}
-    ]
-    total = _get_contribution_sum(client, contributors_enriched_index, query)
+    total = _get_contribution_sum(client, contributors_enriched_index, query, code_types, exclude=True)
     return {"org_non_code_contribution": total, "period": period}
 
 
@@ -1600,10 +1610,7 @@ def org_non_code_contribution_ratio_by_period(client, contributors_enriched_inde
     code_types = ["pr_creation", "pr_comments", "code_author", "code_committer", "pr_merged"]
     # 总非代码贡献量
     total_query = _base_contributor_query(repo_list, from_date, to_date)
-    total_query["query"]["bool"]["must_not"] = [
-        {"terms": {"contribution_type_list.contribution_type.keyword": code_types}}
-    ]
-    total_non_code = _get_contribution_sum(client, contributors_enriched_index, total_query)
+    total_non_code = _get_contribution_sum(client, contributors_enriched_index, total_query, code_types, exclude=True)
 
     # 组织非代码贡献量
     org_non_code = \
@@ -1633,7 +1640,7 @@ def org_code_contribution_by_period(client, contributors_enriched_index, end_dat
         {"terms": {"contribution_type_list.contribution_type.keyword": code_types}}
     ])
 
-    total = _get_contribution_sum(client, contributors_enriched_index, query)
+    total = _get_contribution_sum(client, contributors_enriched_index, query, code_types)
     return {"org_code_contribution": total, "period": period}
 def org_code_contribution_ratio_by_period(client, contributors_enriched_index, end_date, repo_list, period="month"):
     """
@@ -1645,7 +1652,7 @@ def org_code_contribution_ratio_by_period(client, contributors_enriched_index, e
     total_query = _base_contributor_query(repo_list, from_date, to_date, [
         {"terms": {"contribution_type_list.contribution_type.keyword": code_types}}
     ])
-    total_code = _get_contribution_sum(client, contributors_enriched_index, total_query)
+    total_code = _get_contribution_sum(client, contributors_enriched_index, total_query, code_types)
 
     org_code_data = org_code_contribution_by_period(
         client, contributors_enriched_index, end_date, repo_list, period
@@ -1808,10 +1815,7 @@ def individual_non_code_contribution_by_period(client, contributors_enriched_ind
     query = _base_contributor_query(repo_list, from_date, to_date, [
         {"match_phrase": {"ecological_type": "individual participant"}}
     ])
-    query["query"]["bool"]["must_not"] = [
-        {"terms": {"contribution_type_list.contribution_type.keyword": code_types}}
-    ]
-    total = _get_contribution_sum(client, contributors_enriched_index, query)
+    total = _get_contribution_sum(client, contributors_enriched_index, query, code_types, exclude=True)
     return {"individual_non_code_contribution": total, "period": period}
 
 
@@ -1824,10 +1828,7 @@ def individual_non_code_contribution_ratio_by_period(client, contributors_enrich
     code_types = ["pr_creation", "pr_comments", "code_author", "code_committer", "pr_merged"]
     # 总非代码贡献量
     total_query = _base_contributor_query(repo_list, from_date, to_date)
-    total_query["query"]["bool"]["must_not"] = [
-        {"terms": {"contribution_type_list.contribution_type.keyword": code_types}}
-    ]
-    total_non_code = _get_contribution_sum(client, contributors_enriched_index, total_query)
+    total_non_code = _get_contribution_sum(client, contributors_enriched_index, total_query, code_types, exclude=True)
 
     # 个人非代码贡献量
     individual_non_code = \
@@ -1856,7 +1857,7 @@ def individual_code_contribution_by_period(client, contributors_enriched_index, 
         {"terms": {"contribution_type_list.contribution_type.keyword": code_types}}
     ])
 
-    total = _get_contribution_sum(client, contributors_enriched_index, query)
+    total = _get_contribution_sum(client, contributors_enriched_index, query, code_types)
     return {"individual_code_contribution": total, "period": period}
 def individual_code_contribution_ratio_by_period(client, contributors_enriched_index, end_date, repo_list, period="month"):
     """
@@ -1868,7 +1869,7 @@ def individual_code_contribution_ratio_by_period(client, contributors_enriched_i
     total_query = _base_contributor_query(repo_list, from_date, to_date, [
         {"terms": {"contribution_type_list.contribution_type.keyword": code_types}}
     ])
-    total_code = _get_contribution_sum(client, contributors_enriched_index, total_query)
+    total_code = _get_contribution_sum(client, contributors_enriched_index, total_query, code_types)
 
     individual_code_res = individual_code_contribution_by_period(
         client, contributors_enriched_index, end_date, repo_list, period
