@@ -1,0 +1,151 @@
+name: Verify unknown-organization personal contribution
+
+on:
+  push:
+    branches: [verify/personal-unknown-contributions-v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-search:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [elasticsearch, opensearch]
+    env:
+      COMPASS_TEST_SEARCH_URL: http://localhost:9200
+      COMPASS_TEST_SEARCH_CLIENT: ${{ matrix.engine }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Install the repository's declared dependencies
+        run: python -m pip install -r requirements.txt requests==2.31.0
+      - name: Start disposable search service on loopback
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          if [ "$COMPASS_TEST_SEARCH_CLIENT" = elasticsearch ]; then
+            docker run -d --name compass-personal-test -p 127.0.0.1:9200:9200 \
+              -e discovery.type=single-node -e xpack.security.enabled=false \
+              -e ES_JAVA_OPTS='-Xms512m -Xmx512m' \
+              docker.elastic.co/elasticsearch/elasticsearch:6.8.23
+          else
+            docker run -d --name compass-personal-test -p 127.0.0.1:9200:9200 \
+              -e discovery.type=single-node -e DISABLE_INSTALL_DEMO_CONFIG=true \
+              -e DISABLE_SECURITY_PLUGIN=true -e OPENSEARCH_JAVA_OPTS='-Xms512m -Xmx512m' \
+              opensearchproject/opensearch:2.19.0
+          fi
+          python - <<'PY'
+          import time
+          import urllib.request
+          for attempt in range(90):
+              try:
+                  with urllib.request.urlopen('http://localhost:9200', timeout=2) as response:
+                      print(response.read().decode())
+                  break
+              except OSError:
+                  time.sleep(2)
+          else:
+              raise RuntimeError('test search service did not start')
+          PY
+      - name: Prove exact upstream failures and standalone OpenSearch repair
+        if: matrix.engine == 'opensearch'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+          path = Path('compass_metrics_v2/git_metrics_v2.py')
+          fixed = path.read_bytes()
+          original = subprocess.check_output(['git', 'show', '3b5b042ed1db2ec95e58e032ccc5e9d92d690ce7:' + path.as_posix()])
+          runner = """import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_personal_code_contribution.py')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == 18, result.testsRun
+          assert len(result.failures) == EXPECTED, result.failures
+          assert not result.errors, result.errors
+          assert not result.skipped, result.skipped
+          print('Personal suite verified: %d assertion failures, %d passed, 0 errors, 0 skips' % (EXPECTED, 18 - EXPECTED))
+          """
+          try:
+              path.write_bytes(original)
+              subprocess.run([sys.executable, '-c', runner.replace('EXPECTED', '10')], check=True)
+          finally:
+              path.write_bytes(fixed)
+          subprocess.run([sys.executable, '-c', runner.replace('EXPECTED', '0')], check=True)
+          assert path.read_bytes() == fixed
+          PY
+      - name: Verify actual three-way combination with total-hit compatibility PR 360
+        run: |
+          git fetch --no-tags origin cffe13c1bc6b87a5cf3ae29ae93b6bb0fbad3b78
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+          base = '3b5b042ed1db2ec95e58e032ccc5e9d92d690ce7'
+          other = 'cffe13c1bc6b87a5cf3ae29ae93b6bb0fbad3b78'
+          shared = Path('compass_metrics_v2/git_metrics_v2.py')
+          extra = [Path(name) for name in [
+              'compass_metrics/issue_metrics.py', 'compass_metrics/pr_metrics.py',
+              'compass_metrics/security_metric/get_vul_level.py',
+              'compass_metrics_v2/issue_metrics_v2.py', 'compass_metrics_v2/pr_metrics_v2.py',
+              'compass_common/search_results.py', 'tests/test_metric_total_hits.py',
+          ]]
+          saved = {p: p.read_bytes() if p.exists() else None for p in [shared] + extra}
+          def blob(ref, path):
+              return subprocess.check_output(['git', 'show', ref + ':' + path.as_posix()])
+          try:
+              with tempfile.TemporaryDirectory() as directory:
+                  ours, ancestor, theirs = [Path(directory) / name for name in ('ours', 'base', 'theirs')]
+                  ours.write_bytes(saved[shared])
+                  ancestor.write_bytes(blob(base, shared))
+                  theirs.write_bytes(blob(other, shared))
+                  merged = subprocess.check_output(['git', 'merge-file', '-p', str(ours), str(ancestor), str(theirs)])
+              for path in extra:
+                  path.write_bytes(blob(other, path))
+              # First prove the semantic error still exists after fixing integer totals.
+              shared.write_bytes(blob(other, shared))
+              baseline = """import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_personal_code_contribution.py')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == 18, result.testsRun
+          assert len(result.failures) == 10, result.failures
+          assert not result.errors, result.errors
+          assert not result.skipped, result.skipped
+          print('Compatible baseline verified: 10 assertion failures, 8 passed, 0 errors, 0 skips')
+          """
+              subprocess.run([sys.executable, '-c', baseline], check=True)
+              shared.write_bytes(merged)
+              runner = """import unittest
+          suite = unittest.TestSuite()
+          for pattern in ('test_personal_code_contribution.py', 'test_metric_total_hits.py'):
+              suite.addTests(unittest.defaultTestLoader.discover('tests', pattern=pattern))
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == 52, result.testsRun
+          assert result.wasSuccessful(), (result.failures, result.errors)
+          assert not result.skipped, result.skipped
+          print('Three-way combination verified: 52 passed, 0 errors, 0 skips')
+          """
+              subprocess.run([sys.executable, '-c', runner], check=True)
+          finally:
+              for path, content in saved.items():
+                  if content is None:
+                      path.unlink(missing_ok=True)
+                  else:
+                      path.write_bytes(content)
+          assert all((p.read_bytes() if p.exists() else None) == v for p, v in saved.items())
+          PY
+      - name: Service diagnostics and cleanup
+        if: always()
+        run: |
+          docker logs compass-personal-test || true
+          docker rm -f compass-personal-test || true
