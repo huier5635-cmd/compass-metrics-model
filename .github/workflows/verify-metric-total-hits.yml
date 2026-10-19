@@ -1,0 +1,105 @@
+name: Verify integer and object total-hit metrics
+
+on:
+  push:
+    branches: [verify/metric-total-hits-v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-search:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: elasticsearch
+            integer: '0'
+          - engine: opensearch
+            integer: '0'
+          - engine: opensearch
+            integer: '1'
+    env:
+      COMPASS_TEST_SEARCH_URL: http://localhost:9200
+      COMPASS_TEST_SEARCH_CLIENT: ${{ matrix.engine }}
+      COMPASS_TEST_INTEGER_HITS: ${{ matrix.integer }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Install the repository's declared dependencies
+        run: python -m pip install -r requirements.txt requests==2.31.0
+      - name: Start disposable search service on loopback
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          if [ "$COMPASS_TEST_SEARCH_CLIENT" = elasticsearch ]; then
+            docker run -d --name compass-hits-test -p 127.0.0.1:9200:9200 \
+              -e discovery.type=single-node -e xpack.security.enabled=false \
+              -e ES_JAVA_OPTS='-Xms512m -Xmx512m' \
+              docker.elastic.co/elasticsearch/elasticsearch:6.8.23
+          else
+            docker run -d --name compass-hits-test -p 127.0.0.1:9200:9200 \
+              -e discovery.type=single-node -e DISABLE_INSTALL_DEMO_CONFIG=true \
+              -e DISABLE_SECURITY_PLUGIN=true -e OPENSEARCH_JAVA_OPTS='-Xms512m -Xmx512m' \
+              opensearchproject/opensearch:2.19.0
+          fi
+          python - <<'PY'
+          import time
+          import urllib.request
+          for attempt in range(90):
+              try:
+                  with urllib.request.urlopen('http://localhost:9200', timeout=2) as response:
+                      print(response.read().decode())
+                  break
+              except OSError:
+                  time.sleep(2)
+          else:
+              raise RuntimeError('test search service did not start')
+          PY
+      - name: Prove the original integer-total failures and object-format control
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+          targets = [Path(name) for name in ['compass_metrics/issue_metrics.py', 'compass_metrics/pr_metrics.py', 'compass_metrics/security_metric/get_vul_level.py', 'compass_metrics_v2/issue_metrics_v2.py', 'compass_metrics_v2/pr_metrics_v2.py', 'compass_metrics_v2/git_metrics_v2.py']]
+          fixed = {target: target.read_bytes() for target in targets}
+          original = {target: subprocess.check_output([
+              'git', 'show',
+              '3b5b042ed1db2ec95e58e032ccc5e9d92d690ce7:' + target.as_posix(),
+          ]) for target in targets}
+          runner = '''import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_metric_total_hits.py')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == 34, result.testsRun
+          import os
+          expected = 28 if os.environ['COMPASS_TEST_SEARCH_CLIENT'] == 'elasticsearch' or os.environ['COMPASS_TEST_INTEGER_HITS'] == '1' else 0
+          assert not result.failures, result.failures
+          assert len(result.errors) == expected, (expected, result.errors)
+          assert all("TypeError: 'int' object is not subscriptable" in trace for _, trace in result.errors), result.errors
+          assert not result.skipped, result.skipped
+          print('Baseline verified: 0 failures, %d integer-total TypeErrors, %d passed, 0 skips' % (expected, 34 - expected))
+          '''
+          try:
+              for target in targets:
+                  target.write_bytes(original[target])
+              subprocess.run([sys.executable, '-c', runner], check=True)
+          finally:
+              for target in targets:
+                  target.write_bytes(fixed[target])
+          assert all(target.read_bytes() == fixed[target] for target in targets)
+          PY
+      - name: Run all thirty-four checks on the fixed source
+        run: python -m unittest discover -s tests -p test_metric_total_hits.py -v
+      - name: Service diagnostics and cleanup
+        if: always()
+        run: |
+          docker logs compass-hits-test || true
+          docker rm -f compass-hits-test || true
