@@ -1,0 +1,151 @@
+name: Verify non-code contributor counts
+
+on:
+  push:
+    branches: [verify/non-code-contributor-counts-v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-search:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [elasticsearch, opensearch]
+    env:
+      COMPASS_TEST_SEARCH_URL: http://localhost:9200
+      COMPASS_TEST_SEARCH_CLIENT: ${{ matrix.engine }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Install the repository's declared dependencies
+        run: python -m pip install -r requirements.txt requests==2.31.0
+      - name: Start disposable search service on loopback
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          if [ "$COMPASS_TEST_SEARCH_CLIENT" = elasticsearch ]; then
+            docker run -d --name compass-headcount-test -p 127.0.0.1:9200:9200 \
+              -e discovery.type=single-node -e xpack.security.enabled=false \
+              -e ES_JAVA_OPTS='-Xms512m -Xmx512m' \
+              docker.elastic.co/elasticsearch/elasticsearch:6.8.23
+          else
+            docker run -d --name compass-headcount-test -p 127.0.0.1:9200:9200 \
+              -e discovery.type=single-node -e DISABLE_INSTALL_DEMO_CONFIG=true \
+              -e DISABLE_SECURITY_PLUGIN=true -e OPENSEARCH_JAVA_OPTS='-Xms512m -Xmx512m' \
+              opensearchproject/opensearch:2.19.0
+          fi
+          python - <<'PY'
+          import time
+          import urllib.request
+          for attempt in range(90):
+              try:
+                  with urllib.request.urlopen('http://localhost:9200', timeout=2) as response:
+                      print(response.read().decode())
+                  break
+              except OSError:
+                  time.sleep(2)
+          else:
+              raise RuntimeError('test search service did not start')
+          PY
+      - name: Prove fourteen regressions fail on exact upstream source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+          targets = [Path('compass_metrics_v2') / name for name in [
+              'contributor_metrics_v2.py', 'developer_metrics_v2.py',
+          ]]
+          fixed = {target: target.read_bytes() for target in targets}
+          original = {target: subprocess.check_output([
+              'git', 'show',
+              '3b5b042ed1db2ec95e58e032ccc5e9d92d690ce7:' + target.as_posix(),
+          ]) for target in targets}
+          runner = '''import unittest
+          suite = unittest.defaultTestLoader.discover('tests', pattern='test_non_code_contributor_counts.py')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == 19, result.testsRun
+          assert len(result.failures) == 14, len(result.failures)
+          assert not result.errors, result.errors
+          assert not result.skipped, result.skipped
+          print('Baseline verified: 14 failed, 5 passed, 0 errors, 0 skips')
+          '''
+          try:
+              for target in targets:
+                  target.write_bytes(original[target])
+              subprocess.run([sys.executable, '-c', runner], check=True)
+          finally:
+              for target in targets:
+                  target.write_bytes(fixed[target])
+          assert all(target.read_bytes() == fixed[target] for target in targets)
+          PY
+      - name: Run all nineteen regressions on the fixed source
+        run: python -m unittest discover -s tests -p test_non_code_contributor_counts.py -v
+      - name: Verify actual three-way combination with quantity PR 357
+        run: |
+          git fetch --no-tags origin 710eb81dde76520d7cc0d136c390b40020d81b70
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          import unittest
+          base = '3b5b042ed1db2ec95e58e032ccc5e9d92d690ce7'
+          other = '710eb81dde76520d7cc0d136c390b40020d81b70'
+          shared = [Path('compass_metrics_v2') / name for name in [
+              'contributor_metrics_v2.py', 'developer_metrics_v2.py',
+          ]]
+          extra = [Path(name) for name in [
+              'compass_metrics/contributor_metrics.py',
+              'compass_metrics/contribution_utils.py',
+              'tests/test_period_contribution_sums.py',
+          ]]
+          targets = shared + extra
+          saved = {p: p.read_bytes() if p.exists() else None for p in targets}
+          def blob(ref, path):
+              return subprocess.check_output(['git', 'show', ref + ':' + path.as_posix()])
+          try:
+              with tempfile.TemporaryDirectory() as directory:
+                  for path in shared:
+                      ours, ancestor, theirs = [Path(directory) / name for name in ('ours', 'base', 'theirs')]
+                      ours.write_bytes(saved[path])
+                      ancestor.write_bytes(blob(base, path))
+                      theirs.write_bytes(blob(other, path))
+                      merged = subprocess.check_output(['git', 'merge-file', '-p', str(ours), str(ancestor), str(theirs)])
+                      path.write_bytes(merged)
+              for path in extra:
+                  path.write_bytes(blob(other, path))
+              # Use a separate interpreter: fixed-source tests already ran in an earlier step.
+              runner = """import unittest
+          suite = unittest.TestSuite()
+          for pattern in ('test_non_code_contributor_counts.py', 'test_period_contribution_sums.py'):
+              suite.addTests(unittest.defaultTestLoader.discover('tests', pattern=pattern))
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == 44, result.testsRun
+          assert result.wasSuccessful(), (result.failures, result.errors)
+          assert not result.skipped, result.skipped
+          print('Three-way combination verified: 44 passed, 0 errors, 0 skips')
+          """
+              import sys
+              subprocess.run([sys.executable, '-c', runner], check=True)
+          finally:
+              for path, content in saved.items():
+                  if content is None:
+                      path.unlink(missing_ok=True)
+                  else:
+                      path.write_bytes(content)
+          assert all((p.read_bytes() if p.exists() else None) == v for p, v in saved.items())
+          PY
+      - name: Service diagnostics and cleanup
+        if: always()
+        run: |
+          docker logs compass-headcount-test || true
+          docker rm -f compass-headcount-test || true
