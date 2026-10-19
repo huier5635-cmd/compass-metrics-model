@@ -8,11 +8,12 @@ The suite creates and deletes only its own uniquely named test indices.
 
 import os
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from compass_metrics_v2 import contributor_metrics_v2 as metrics
 from compass_metrics_v2 import developer_metrics_v2 as developer_metrics
+from compass_metrics import contributor_metrics as legacy_metrics
 
 
 URL = os.environ.get("COMPASS_TEST_SEARCH_URL")
@@ -211,6 +212,75 @@ class PeriodContributionSumsTest(unittest.TestCase):
             contribution("person", "individual participant", [("issue_comments", 2 ** 31 + 3)]),
         ])
         self.assert_totals(2 ** 31 + 9, 0, 0, 2 ** 31 + 3)
+
+
+    def assert_types(self, module, expected):
+        self.assertEqual(module.types_of_contributions(self.client, self.index, DATE, [REPO]), {
+            "types_of_contributions": len(expected),
+            "types_of_contributions_detail": [
+                {"contribution_type": kind, "contributor": people, "contribution": count}
+                for kind, people, count in expected
+            ],
+        })
+
+    def mixed_types(self, module):
+        self.mixed()
+        self.assert_types(module, [
+            ("code_author", 1, 2), ("code_committer", 1, 1), ("fork", 1, 17),
+            ("issue_comments", 1, 11), ("issue_creation", 1, 7),
+            ("pr_comments", 1, 3), ("pr_merged", 1, 2), ("star", 1, 13),
+        ])
+
+    def repeated_contributor_types(self, module):
+        self.insert([
+            contribution("same", "organization participant", [("code_author", 2), ("issue_comments", 7)]),
+            contribution("same", "organization participant", [("code_author", 5)]),
+            contribution("other", "individual participant", [("code_author", 3), ("issue_comments", 11)]),
+        ])
+        self.assert_types(module, [("code_author", 2, 10), ("issue_comments", 2, 18)])
+
+    def filtered_types(self, module):
+        self.insert([
+            contribution("org", "organization participant", [
+                ("issue_comments", 2 ** 31 + 3), ("自定义贡献", 7), ("star", 13),
+            ]),
+            # Type summaries have always included bot activity, unlike period governance counts.
+            contribution("bot", "individual participant", [("自定义贡献", 11)], is_bot=True),
+            contribution("edge", "individual participant", [("star", 5)],
+                         grimoire_creation_date=(DATE - timedelta(days=90)).isoformat()),
+            contribution("edge", "individual participant", [("star", 2)],
+                         grimoire_creation_date=DATE.isoformat()),
+            contribution("elsewhere", "individual participant", [("自定义贡献", 1000)], repo_name="other"),
+            contribution("old", "individual participant", [("star", 2000)],
+                         grimoire_creation_date="2025-01-01T12:00:00"),
+            contribution("future", "individual participant", [("star", 3000)],
+                         grimoire_creation_date="2026-02-01T12:00:00"),
+        ])
+        self.assert_types(module, [("star", 2, 20), ("自定义贡献", 2, 18), ("issue_comments", 1, 2 ** 31 + 3)])
+
+    def test_legacy_type_summary_keeps_mixed_counts_paired(self):
+        self.mixed_types(legacy_metrics)
+
+    def test_v2_type_summary_keeps_mixed_counts_paired(self):
+        self.mixed_types(metrics)
+
+    def test_legacy_type_summary_deduplicates_contributors(self):
+        self.repeated_contributor_types(legacy_metrics)
+
+    def test_v2_type_summary_deduplicates_contributors(self):
+        self.repeated_contributor_types(metrics)
+
+    def test_legacy_type_summary_preserves_filters_and_unknown_types(self):
+        self.filtered_types(legacy_metrics)
+
+    def test_v2_type_summary_preserves_filters_and_unknown_types(self):
+        self.filtered_types(metrics)
+
+    def test_empty_legacy_type_summary(self):
+        self.assert_types(legacy_metrics, [])
+
+    def test_empty_v2_type_summary(self):
+        self.assert_types(metrics, [])
 
 
 if __name__ == "__main__":

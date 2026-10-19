@@ -1,3 +1,4 @@
+from compass_metrics.contribution_utils import contribution_sum_aggregation, get_contribution_types
 from compass_metrics.db_dsl import get_contributor_query, get_uuid_count_query
 from compass_common.datetime import check_times_has_overlap
 from compass_common.opensearch_utils import get_all_index_data
@@ -1203,7 +1204,7 @@ def activity_domain_contributor(client, contributors_enriched_index, date, repo_
 
 
 def types_of_contributions(client, contributors_enriched_index, date, repo_list):
-    """ Define the types of contributions and their contributions over the past 90 days.  """
+    """Report activity types and their counts over the past 90 days."""
     from_date = date - timedelta(days=90)
     query = {
         "query": {
@@ -1220,40 +1221,11 @@ def types_of_contributions(client, contributors_enriched_index, date, repo_list)
                 "terms": {
                     "field": "contribution_type_list.contribution_type.keyword",
                     "size": 50
-                },
-                "aggs": {
-                    "total_contributions": {
-                        "sum": {
-                            "field": "contribution_type_list.contribution"
-                        }
-                    },
-                    "unique_contributors": {
-                        "cardinality": {
-                            "field": "contributor.keyword"
-                        }
-                    }
                 }
             }
         }
     }
-    response = client.search(index=contributors_enriched_index, body=query)
-    contribution_detail = []
-    total_contribution_types = 0
-    for bucket in response['aggregations']['contribution_types']['buckets']:
-        contribution_type = bucket['key']
-        total_contributions = bucket['total_contributions']['value']
-        unique_contributors = bucket['unique_contributors']['value']
-        contribution_detail.append({
-            "contribution_type": contribution_type,
-            "contributor": unique_contributors,
-            "contribution": total_contributions
-        })
-        total_contribution_types += 1
-    result = {
-        'types_of_contributions': total_contribution_types,
-        'types_of_contributions_detail': contribution_detail
-    }
-    return result
+    return get_contribution_types(client, contributors_enriched_index, query)
 
 
 def org_contributor_count_year(client, contributors_index, date, repo_list):
@@ -1427,22 +1399,7 @@ def _get_contribution_sum(client, index, query, contribution_types, exclude=Fals
     """Sum matching activity entries, rather than the contributor's all-type total."""
     query_copy = query.copy()
     query_copy["aggs"] = {
-        "total_contribution": {
-            "sum": {
-                "script": {
-                    "source": """
-                        double total = 0;
-                        for (def item : params._source.contribution_type_list) {
-                            if (params.types.contains(item.contribution_type) != params.exclude) {
-                                total += item.contribution;
-                            }
-                        }
-                        return total;
-                    """,
-                    "params": {"types": contribution_types, "exclude": exclude}
-                }
-            }
-        }
+        "total_contribution": contribution_sum_aggregation(contribution_types, exclude)
     }
     result = client.search(index=index, body=query_copy)
     return result["aggregations"]["total_contribution"]["value"]
